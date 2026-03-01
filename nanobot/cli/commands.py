@@ -315,20 +315,52 @@ def gateway(
     # Create channel manager
     channels = ChannelManager(config, bus)
 
+    _boss_target_cache: tuple[str, str] | None = None
+
     def _pick_heartbeat_target() -> tuple[str, str]:
-        """Pick a routable channel/chat target for heartbeat-triggered messages."""
+        """Pick the BOSS's channel/chat target for heartbeat messages.
+
+        Auto-detects the boss by scanning session files for [BOSS] prefixed
+        messages (set by WhatsApp channel when from_me=True).  Caches the
+        result so we only scan once.
+        """
+        nonlocal _boss_target_cache
+        if _boss_target_cache is not None:
+            return _boss_target_cache
+
+        import json as _json
+
         enabled = set(channels.enabled_channels)
-        # Prefer the most recently updated non-internal session on an enabled channel.
         for item in session_manager.list_sessions():
             key = item.get("key") or ""
             if ":" not in key:
                 continue
             channel, chat_id = key.split(":", 1)
-            if channel in {"cli", "system"}:
+            if channel in {"cli", "system", "heartbeat"}:
                 continue
-            if channel in enabled and chat_id:
-                return channel, chat_id
-        # Fallback keeps prior behavior but remains explicit.
+            if channel not in enabled or not chat_id:
+                continue
+            # Scan the session file for [BOSS] messages
+            path = item.get("path")
+            if not path:
+                continue
+            try:
+                with open(path, encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        data = _json.loads(line)
+                        content = data.get("content", "")
+                        if isinstance(content, str) and "[BOSS]" in content:
+                            _boss_target_cache = (channel, chat_id)
+                            logger.info("Heartbeat: auto-detected boss session {}:{}", channel, chat_id)
+                            return channel, chat_id
+            except Exception:
+                continue
+
+        # Fallback: no boss session found yet — use cli (won't send externally).
+        logger.warning("Heartbeat: could not detect boss session, falling back to cli")
         return "cli", "direct"
 
     # Create heartbeat service

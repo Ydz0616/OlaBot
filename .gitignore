@@ -1,5 +1,8 @@
 .assets
 .env
+.DS_Store
+node_modules/
+package-lock.json
 *.pyc
 dist/
 build/

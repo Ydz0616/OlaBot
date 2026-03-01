@@ -2,8 +2,11 @@
 
 import asyncio
 import json
+import os
 from collections import OrderedDict
 from typing import Any
+
+import httpx
 
 from loguru import logger
 
@@ -90,6 +93,10 @@ class WhatsAppChannel(BaseChannel):
                 "text": msg.content
             }
             await self._ws.send(json.dumps(payload, ensure_ascii=False))
+            
+            # Auto-log outbound message to DB
+            recipient_id = msg.chat_id.split("@")[0] if "@" in msg.chat_id else msg.chat_id
+            await self._log_outbound(recipient_id, msg.content)
         except Exception as e:
             logger.error("Error sending WhatsApp message: {}", e)
     
@@ -151,6 +158,17 @@ class WhatsAppChannel(BaseChannel):
                 content = f"[CLIENT from {sender_id}]: {content}"
                 logger.info("Client message from {}: {}", sender_id, content[:80])
 
+            # ── Pre-processing: auto-log + client lookup (Python, not LLM) ──
+            if not from_me:
+                client_info = await self._pre_process(sender_id, content, from_me)
+                if client_info:
+                    # Inject client context so agent knows who it's talking to
+                    client_name = client_info.get("name", "Unknown")
+                    content = f"[CLIENT from {sender_id} ({client_name})]: {data.get('content', '')}"
+            else:
+                # Boss messages: outbound replies get logged via send() → _log_outbound
+                pass
+
             await self._handle_message(
                 sender_id=sender_id,
                 chat_id=reply_chat_id,  # Use phone-based JID, never LID
@@ -179,3 +197,84 @@ class WhatsAppChannel(BaseChannel):
         
         elif msg_type == "error":
             logger.error("WhatsApp bridge error: {}", data.get('error'))
+
+    # ── Pre-processing pipeline ──────────────────────────────────────
+    
+    @property
+    def _api_base(self) -> str:
+        return os.environ.get("OLAINTEL_API_URL", "http://localhost:8000")
+
+    async def _pre_process(self, sender_id: str, content: str, from_me: bool) -> dict | None:
+        """Auto-log message + lookup/create client. Returns client info dict or None."""
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as http:
+                # 1. Find client by WhatsApp ID
+                resp = await http.get(f"{self._api_base}/api/clients")
+                clients = resp.json()
+                client = None
+                for c in clients:
+                    wid = c.get("whatsapp_id", "")
+                    # Normalize: strip @s.whatsapp.net suffix for comparison
+                    wid_clean = wid.split("@")[0] if "@" in wid else wid
+                    if wid_clean == sender_id or wid == sender_id:
+                        client = c
+                        break
+                
+                # 2. Create client if not found
+                if not client:
+                    resp = await http.post(f"{self._api_base}/api/clients", json={
+                        "name": f"Unknown ({sender_id})",
+                        "whatsapp_id": sender_id,
+                        "language": "unknown",
+                    })
+                    if resp.status_code in (200, 201):
+                        client = resp.json()
+                        logger.info("Created new client for {}", sender_id)
+                
+                # 3. Log the inbound message
+                if client:
+                    # Extract raw text (without [CLIENT from ...] prefix)
+                    raw_text = content
+                    if raw_text.startswith("[CLIENT"):
+                        raw_text = raw_text.split("]: ", 1)[-1] if "]: " in raw_text else raw_text
+                    
+                    await http.post(f"{self._api_base}/api/messages", json={
+                        "client_id": client["id"],
+                        "source": "whatsapp",
+                        "direction": "inbound",
+                        "original_text": raw_text,
+                        "language_from": client.get("language", "unknown"),
+                    })
+                    logger.info("Logged inbound message from {} (client_id={})", sender_id, client["id"])
+                
+                return client
+        except Exception as e:
+            logger.warning("Pre-processing failed (non-fatal): {}", e)
+            return None
+
+    async def _log_outbound(self, recipient_id: str, content: str) -> None:
+        """Log outbound (agent reply) message to DB."""
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as http:
+                # Find client by phone
+                resp = await http.get(f"{self._api_base}/api/clients")
+                clients = resp.json()
+                client = None
+                for c in clients:
+                    wid = c.get("whatsapp_id", "")
+                    wid_clean = wid.split("@")[0] if "@" in wid else wid
+                    if wid_clean == recipient_id or wid == recipient_id:
+                        client = c
+                        break
+                
+                if client:
+                    await http.post(f"{self._api_base}/api/messages", json={
+                        "client_id": client["id"],
+                        "source": "whatsapp",
+                        "direction": "outbound",
+                        "original_text": content,
+                        "language_from": client.get("language", "unknown"),
+                    })
+                    logger.info("Logged outbound reply to {} (client_id={})", recipient_id, client["id"])
+        except Exception as e:
+            logger.warning("Outbound logging failed (non-fatal): {}", e)
