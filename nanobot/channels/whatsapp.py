@@ -119,24 +119,47 @@ class WhatsAppChannel(BaseChannel):
                 while len(self._processed_message_ids) > 1000:
                     self._processed_message_ids.popitem(last=False)
 
-            # Extract just the phone number or lid as chat_id
+            # Extract phone number — prefer pn (real phone) over sender (LID)
+            # pn = "8615653637766@s.whatsapp.net", sender = "181836131086344@lid"
             user_id = pn if pn else sender
             sender_id = user_id.split("@")[0] if "@" in user_id else user_id
-            logger.info("Sender {}", sender)
+            
+            # Build proper chat_id for replies: always use phone@s.whatsapp.net
+            # NEVER use @lid — Baileys can't send to LID addresses
+            if pn:
+                reply_chat_id = pn  # e.g. "8615653637766@s.whatsapp.net"
+            elif "@lid" not in sender:
+                reply_chat_id = sender  # already @s.whatsapp.net
+            else:
+                reply_chat_id = f"{sender_id}@s.whatsapp.net"  # fallback
+            
+            logger.info("Sender {} → reply_to {}", sender, reply_chat_id)
 
             # Handle voice transcription if it's a voice message
             if content == "[Voice Message]":
                 logger.info("Voice message received from {}, but direct download from bridge is not yet supported.", sender_id)
                 content = "[Voice Message: Transcription not available for WhatsApp yet]"
 
+            # Detect if message is from the boss (fromMe = true)
+            from_me = data.get("fromMe", False)
+            
+            # Add clear identity prefix so LLM never confuses boss/client
+            if from_me:
+                content = f"[BOSS]: {content}"
+                logger.info("Boss message from {}: {}", sender_id, content[:80])
+            else:
+                content = f"[CLIENT from {sender_id}]: {content}"
+                logger.info("Client message from {}: {}", sender_id, content[:80])
+
             await self._handle_message(
                 sender_id=sender_id,
-                chat_id=sender,  # Use full LID for replies
+                chat_id=reply_chat_id,  # Use phone-based JID, never LID
                 content=content,
                 metadata={
                     "message_id": message_id,
                     "timestamp": data.get("timestamp"),
-                    "is_group": data.get("isGroup", False)
+                    "is_group": data.get("isGroup", False),
+                    "from_me": from_me,
                 }
             )
         

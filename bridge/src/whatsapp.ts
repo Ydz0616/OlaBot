@@ -24,6 +24,22 @@ export interface InboundMessage {
   content: string;
   timestamp: number;
   isGroup: boolean;
+  fromMe: boolean;
+}
+
+export interface SyncedContact {
+  id: string;
+  name: string | null;
+  pushName: string | null;
+  phone: string | null;
+}
+
+export interface SyncedMessage {
+  id: string;
+  remoteJid: string;
+  fromMe: boolean;
+  content: string;
+  timestamp: number;
 }
 
 export interface WhatsAppClientOptions {
@@ -37,6 +53,8 @@ export class WhatsAppClient {
   private sock: any = null;
   private options: WhatsAppClientOptions;
   private reconnecting = false;
+  private contacts: Map<string, SyncedContact> = new Map();
+  private historyMessages: Map<string, SyncedMessage[]> = new Map();
 
   constructor(options: WhatsAppClientOptions) {
     this.options = options;
@@ -59,7 +77,7 @@ export class WhatsAppClient {
       logger,
       printQRInTerminal: false,
       browser: ['nanobot', 'cli', VERSION],
-      syncFullHistory: false,
+      syncFullHistory: true,
       markOnlineOnConnect: false,
     });
 
@@ -105,14 +123,36 @@ export class WhatsAppClient {
     // Save credentials on update
     this.sock.ev.on('creds.update', saveCreds);
 
+    // Handle contact syncs
+    this.sock.ev.on('contacts.upsert', (contacts: any[]) => {
+      console.log(`📇 Synced ${contacts.length} contacts`);
+      for (const c of contacts) {
+        const id = c.id || '';
+        if (!id || id === 'status@broadcast') continue;
+        // Extract phone from JID (e.g. 8618936119618@s.whatsapp.net → 8618936119618)
+        const phone = id.includes('@') ? id.split('@')[0] : null;
+        this.contacts.set(id, {
+          id,
+          name: c.name || c.verifiedName || null,
+          pushName: c.notify || null,
+          phone,
+        });
+      }
+    });
+
+    this.sock.ev.on('contacts.update', (updates: any[]) => {
+      for (const u of updates) {
+        const existing = this.contacts.get(u.id);
+        if (existing) {
+          if (u.name) existing.name = u.name;
+          if (u.notify) existing.pushName = u.notify;
+        }
+      }
+    });
+
     // Handle incoming messages
     this.sock.ev.on('messages.upsert', async ({ messages, type }: { messages: any[]; type: string }) => {
-      if (type !== 'notify') return;
-
       for (const msg of messages) {
-        // Skip own messages
-        if (msg.key.fromMe) continue;
-
         // Skip status updates
         if (msg.key.remoteJid === 'status@broadcast') continue;
 
@@ -120,14 +160,36 @@ export class WhatsAppClient {
         if (!content) continue;
 
         const isGroup = msg.key.remoteJid?.endsWith('@g.us') || false;
+        const fromMe = msg.key.fromMe || false;
+        const jid = msg.key.remoteJid || '';
+
+        // Store history sync messages (type = 'append' for history)
+        if (type === 'append') {
+          const existing = this.historyMessages.get(jid) || [];
+          if (existing.length < 10) {
+            existing.push({
+              id: msg.key.id || '',
+              remoteJid: jid,
+              fromMe,
+              content,
+              timestamp: msg.messageTimestamp as number,
+            });
+            this.historyMessages.set(jid, existing);
+          }
+          continue;
+        }
+
+        // Live messages (type = 'notify')
+        if (type !== 'notify') continue;
 
         this.options.onMessage({
           id: msg.key.id || '',
-          sender: msg.key.remoteJid || '',
+          sender: jid,
           pn: msg.key.remoteJidAlt || '',
           content,
           timestamp: msg.messageTimestamp as number,
           isGroup,
+          fromMe,
         });
       }
     });
@@ -175,7 +237,49 @@ export class WhatsAppClient {
       throw new Error('Not connected');
     }
 
-    await this.sock.sendMessage(to, { text });
+    // Robust JID normalization
+    let jid = to.replace(/^\+/, ''); // strip leading +
+    if (jid.endsWith('@lid')) {
+      // LID addresses cannot receive messages — this is a bug in chat_id resolution
+      console.warn(`⚠️ Cannot send to LID address: ${to}. Use phone number instead.`);
+      throw new Error(`Cannot send to LID address: ${to}. Use a phone number like 8615653637766@s.whatsapp.net`);
+    } else if (!jid.includes('@')) {
+      jid = `${jid}@s.whatsapp.net`;
+    }
+
+    await this.sock.sendMessage(jid, { text });
+  }
+
+  getContacts(): SyncedContact[] {
+    // Return from our contacts map
+    if (this.contacts.size > 0) {
+      return Array.from(this.contacts.values());
+    }
+    // Fallback: try to read from socket's internal store
+    try {
+      const store = this.sock?.store;
+      if (store?.contacts) {
+        const result: SyncedContact[] = [];
+        for (const [id, c] of Object.entries(store.contacts) as [string, any][]) {
+          if (!id || id === 'status@broadcast') continue;
+          const phone = id.includes('@') ? id.split('@')[0] : null;
+          result.push({
+            id,
+            name: c.name || c.verifiedName || null,
+            pushName: c.notify || null,
+            phone,
+          });
+        }
+        return result;
+      }
+    } catch (e) {
+      // ignore
+    }
+    return [];
+  }
+
+  getHistoryMessages(): Map<string, SyncedMessage[]> {
+    return this.historyMessages;
   }
 
   async disconnect(): Promise<void> {
