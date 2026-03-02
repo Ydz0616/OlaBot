@@ -112,10 +112,11 @@ class WhatsAppChannel(BaseChannel):
         
         if msg_type == "message":
             # Incoming message from WhatsApp
-            # Deprecated by whatsapp: old phone number style typically: <phone>@s.whatspp.net
-            pn = data.get("pn", "")
-            # New LID sytle typically:
-            sender = data.get("sender", "")
+            # Bridge sends two IDs but they can arrive in EITHER field:
+            #   - phone number: <digits>@s.whatsapp.net  (what we need for replies)
+            #   - LID:          <digits>@lid             (cannot send to this)
+            raw_pn = data.get("pn", "")
+            raw_sender = data.get("sender", "")
             content = data.get("content", "")
             message_id = data.get("id", "")
 
@@ -126,26 +127,42 @@ class WhatsAppChannel(BaseChannel):
                 while len(self._processed_message_ids) > 1000:
                     self._processed_message_ids.popitem(last=False)
 
-            # Extract phone number — prefer pn (real phone) over sender (LID)
-            # pn = "8615653637766@s.whatsapp.net", sender = "181836131086344@lid"
-            user_id = pn if pn else sender
-            sender_id = user_id.split("@")[0] if "@" in user_id else user_id
-            
-            # Build proper chat_id for replies: always use phone@s.whatsapp.net
-            # NEVER use @lid — Baileys can't send to LID addresses
-            if pn:
-                reply_chat_id = pn  # e.g. "8615653637766@s.whatsapp.net"
-            elif "@lid" not in sender:
-                reply_chat_id = sender  # already @s.whatsapp.net
+            # ── Smart routing: detect which field is the phone number ──
+            # Don't trust field names — pick whichever contains @s.whatsapp.net
+            phone_jid = ""
+            lid_jid = ""
+            for candidate in [raw_pn, raw_sender]:
+                if "@s.whatsapp.net" in candidate:
+                    phone_jid = candidate
+                elif "@lid" in candidate:
+                    lid_jid = candidate
+
+            # Use phone number for both sender_id and reply_chat_id
+            if phone_jid:
+                sender_id = phone_jid.split("@")[0]
+                reply_chat_id = phone_jid
+            elif lid_jid:
+                # Fallback: only LID available (shouldn't happen normally)
+                sender_id = lid_jid.split("@")[0]
+                reply_chat_id = f"{sender_id}@s.whatsapp.net"
+                logger.warning("Only LID available for sender {}, fabricating phone JID", sender_id)
             else:
-                reply_chat_id = f"{sender_id}@s.whatsapp.net"  # fallback
+                # Neither — use whatever we got
+                fallback = raw_pn or raw_sender
+                sender_id = fallback.split("@")[0] if "@" in fallback else fallback
+                reply_chat_id = f"{sender_id}@s.whatsapp.net"
             
-            logger.info("Sender {} → reply_to {}", sender, reply_chat_id)
+            logger.info("Sender {} → reply_to {} (phone_jid={}, lid_jid={})", raw_sender, reply_chat_id, phone_jid, lid_jid)
 
             # Handle voice transcription if it's a voice message
             if content == "[Voice Message]":
                 logger.info("Voice message received from {}, but direct download from bridge is not yet supported.", sender_id)
                 content = "[Voice Message: Transcription not available for WhatsApp yet]"
+
+            # Extract display names from bridge (pushName = WA profile name, contactName = saved contact name)
+            push_name = data.get("pushName", "")
+            contact_name = data.get("contactName", "")
+            display_name = contact_name or push_name  # prefer saved contact name
 
             # Detect if message is from the boss (fromMe = true)
             from_me = data.get("fromMe", False)
@@ -160,7 +177,7 @@ class WhatsAppChannel(BaseChannel):
 
             # ── Pre-processing: auto-log + client lookup (Python, not LLM) ──
             if not from_me:
-                client_info = await self._pre_process(sender_id, content, from_me)
+                client_info = await self._pre_process(sender_id, content, from_me, display_name)
                 if client_info:
                     # Inject client context so agent knows who it's talking to
                     client_name = client_info.get("name", "Unknown")
@@ -199,13 +216,13 @@ class WhatsAppChannel(BaseChannel):
             logger.error("WhatsApp bridge error: {}", data.get('error'))
 
     # ── Pre-processing pipeline ──────────────────────────────────────
-    
+
     @property
     def _api_base(self) -> str:
         return os.environ.get("OLAINTEL_API_URL", "http://localhost:8000")
 
-    async def _pre_process(self, sender_id: str, content: str, from_me: bool) -> dict | None:
-        """Auto-log message + lookup/create client. Returns client info dict or None."""
+    async def _pre_process(self, sender_id: str, content: str, from_me: bool, display_name: str = "") -> dict | None:
+        """Auto-log message + lookup/create client. Updates name if better name available. Returns client info dict or None."""
         try:
             async with httpx.AsyncClient(timeout=5.0) as http:
                 # 1. Find client by WhatsApp ID
@@ -223,15 +240,33 @@ class WhatsAppChannel(BaseChannel):
                 # 2. Create client if not found
                 if not client:
                     resp = await http.post(f"{self._api_base}/api/clients", json={
-                        "name": f"Unknown ({sender_id})",
+                        "name": display_name or f"Unknown ({sender_id})",
                         "whatsapp_id": sender_id,
                         "language": "unknown",
                     })
                     if resp.status_code in (200, 201):
                         client = resp.json()
-                        logger.info("Created new client for {}", sender_id)
+                        logger.info("Created new client for {} (name={})", sender_id, display_name or "Unknown")
                 
-                # 3. Log the inbound message
+                # 3. Update name if current name is poor quality and we have a better one
+                if client and display_name:
+                    old_name = client.get("name", "")
+                    name_is_poor = (
+                        not old_name
+                        or old_name == "Unknown"
+                        or old_name.startswith("Unknown (")
+                        or old_name.isdigit()
+                        or old_name.startswith("+")
+                    )
+                    if name_is_poor:
+                        await http.put(
+                            f"{self._api_base}/api/clients/{client['id']}",
+                            json={"name": display_name},
+                        )
+                        client["name"] = display_name
+                        logger.info("Updated client name: {} → {} (id={})", old_name, display_name, client["id"])
+
+                # 4. Log the inbound message
                 if client:
                     # Extract raw text (without [CLIENT from ...] prefix)
                     raw_text = content

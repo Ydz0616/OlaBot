@@ -25,6 +25,8 @@ export interface InboundMessage {
   timestamp: number;
   isGroup: boolean;
   fromMe: boolean;
+  pushName: string;
+  contactName: string;
 }
 
 export interface SyncedContact {
@@ -182,6 +184,11 @@ export class WhatsAppClient {
         // Live messages (type = 'notify')
         if (type !== 'notify') continue;
 
+        // Extract display names for contact resolution
+        const pushName = msg.pushName || '';
+        const savedContact = this.contacts.get(jid);
+        const contactName = savedContact?.name || savedContact?.pushName || '';
+
         this.options.onMessage({
           id: msg.key.id || '',
           sender: jid,
@@ -190,6 +197,8 @@ export class WhatsAppClient {
           timestamp: msg.messageTimestamp as number,
           isGroup,
           fromMe,
+          pushName,
+          contactName,
         });
       }
     });
