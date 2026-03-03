@@ -98,7 +98,7 @@ export class BridgeServer {
   private handleHTTP(req: IncomingMessage, res: ServerResponse): void {
     // CORS headers for frontend
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
     res.setHeader('Content-Type', 'application/json');
 
@@ -137,6 +137,39 @@ export class BridgeServer {
         count: Object.keys(result).length,
         history: result,
       }));
+    } else if (req.url === '/test/inject' && req.method === 'POST') {
+      // ── Test-only endpoint: inject a fake WhatsApp message ──
+      // ONLY active when BRIDGE_TEST_MODE=true (never set in production)
+      if (process.env.BRIDGE_TEST_MODE !== 'true') {
+        res.writeHead(403);
+        res.end(JSON.stringify({ error: 'Test mode not enabled' }));
+        return;
+      }
+      let body = '';
+      req.on('data', (chunk) => { body += chunk; });
+      req.on('end', () => {
+        try {
+          const data = JSON.parse(body);
+          const msg: BridgeMessage = {
+            type: 'message',
+            id: `test_${Date.now()}`,
+            sender: data.sender || '15551234567@s.whatsapp.net',
+            pn: data.pn || '',
+            content: data.content || '',
+            timestamp: Date.now(),
+            isGroup: data.isGroup || false,
+            fromMe: data.fromMe ?? false,
+            pushName: data.pushName || 'TestUser',
+            contactName: data.contactName || '',
+          };
+          this.broadcast(msg);
+          res.writeHead(200);
+          res.end(JSON.stringify({ ok: true, injected: msg }));
+        } catch (err) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: 'Invalid JSON' }));
+        }
+      });
     } else {
       res.writeHead(404);
       res.end(JSON.stringify({ error: 'Not found' }));
