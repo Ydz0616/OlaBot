@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import time
 from collections import OrderedDict
 from typing import Any
 
@@ -33,6 +34,11 @@ class WhatsAppChannel(BaseChannel):
         self._connected = False
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()
         self._boss_phone: str = ""  # Set by bridge on connect via __SELF_PHONE__
+        # ── Performance: shared HTTP client & client cache ──
+        self._http: httpx.AsyncClient | None = None
+        self._client_cache: dict[str, dict] = {}   # phone → client dict
+        self._cache_ts: float = 0.0                  # timestamp of last full refresh
+        self._CACHE_TTL = 300                        # 5 minutes
     
     async def start(self) -> None:
         """Start the WhatsApp channel by connecting to the bridge."""
@@ -238,6 +244,48 @@ class WhatsAppChannel(BaseChannel):
 
     # ── Pre-processing pipeline ──────────────────────────────────────
 
+    # ── Shared HTTP client & client cache ────────────────────────────
+
+    def _get_http(self) -> httpx.AsyncClient:
+        """Get or create shared HTTP client."""
+        if self._http is None or self._http.is_closed:
+            self._http = httpx.AsyncClient(timeout=5.0)
+        return self._http
+
+    async def _refresh_client_cache(self) -> None:
+        """Refresh the full client cache from backend."""
+        try:
+            http = self._get_http()
+            resp = await http.get(f"{self._api_base}/api/clients")
+            clients = resp.json()
+            self._client_cache.clear()
+            for c in clients:
+                wid = c.get("whatsapp_id", "")
+                wid_clean = wid.split("@")[0] if "@" in wid else wid
+                if wid_clean:
+                    self._client_cache[wid_clean] = c
+                if wid and wid != wid_clean:
+                    self._client_cache[wid] = c
+            self._cache_ts = time.monotonic()
+            logger.debug("Client cache refreshed: {} entries", len(self._client_cache))
+        except Exception as e:
+            logger.warning("Client cache refresh failed: {}", e)
+
+    async def _lookup_client(self, phone: str) -> dict | None:
+        """Lookup client by phone with caching. Returns client dict or None."""
+        # Refresh cache if stale
+        if time.monotonic() - self._cache_ts > self._CACHE_TTL:
+            await self._refresh_client_cache()
+        
+        # Try cache hit
+        client = self._client_cache.get(phone)
+        if client:
+            return client
+        
+        # Miss — try one more refresh in case it's a new client
+        await self._refresh_client_cache()
+        return self._client_cache.get(phone)
+
     @property
     def _api_base(self) -> str:
         return os.environ.get("OLAINTEL_API_URL", "http://localhost:8000")
@@ -245,65 +293,58 @@ class WhatsAppChannel(BaseChannel):
     async def _pre_process(self, sender_id: str, content: str, from_me: bool, display_name: str = "") -> dict | None:
         """Auto-log message + lookup/create client. Updates name if better name available. Returns client info dict or None."""
         try:
-            async with httpx.AsyncClient(timeout=5.0) as http:
-                # 1. Find client by WhatsApp ID
-                resp = await http.get(f"{self._api_base}/api/clients")
-                clients = resp.json()
-                client = None
-                for c in clients:
-                    wid = c.get("whatsapp_id", "")
-                    # Normalize: strip @s.whatsapp.net suffix for comparison
-                    wid_clean = wid.split("@")[0] if "@" in wid else wid
-                    if wid_clean == sender_id or wid == sender_id:
-                        client = c
-                        break
-                
-                # 2. Create client if not found
-                if not client:
-                    resp = await http.post(f"{self._api_base}/api/clients", json={
-                        "name": display_name or f"Unknown ({sender_id})",
-                        "whatsapp_id": sender_id,
-                        "language": "unknown",
-                    })
-                    if resp.status_code in (200, 201):
-                        client = resp.json()
-                        logger.info("Created new client for {} (name={})", sender_id, display_name or "Unknown")
-                
-                # 3. Update name if current name is poor quality and we have a better one
-                if client and display_name:
-                    old_name = client.get("name", "")
-                    name_is_poor = (
-                        not old_name
-                        or old_name == "Unknown"
-                        or old_name.startswith("Unknown (")
-                        or old_name.isdigit()
-                        or old_name.startswith("+")
-                    )
-                    if name_is_poor:
-                        await http.put(
-                            f"{self._api_base}/api/clients/{client['id']}",
-                            json={"name": display_name},
-                        )
-                        client["name"] = display_name
-                        logger.info("Updated client name: {} → {} (id={})", old_name, display_name, client["id"])
+            http = self._get_http()
 
-                # 4. Log the inbound message
-                if client:
-                    # Extract raw text (without [CLIENT from ...] prefix)
-                    raw_text = content
-                    if raw_text.startswith("[CLIENT"):
-                        raw_text = raw_text.split("]: ", 1)[-1] if "]: " in raw_text else raw_text
-                    
-                    await http.post(f"{self._api_base}/api/messages", json={
-                        "client_id": client["id"],
-                        "source": "whatsapp",
-                        "direction": "inbound",
-                        "original_text": raw_text,
-                        "language_from": client.get("language", "unknown"),
-                    })
-                    logger.info("Logged inbound message from {} (client_id={})", sender_id, client["id"])
+            # 1. Find client by WhatsApp ID (cached)
+            client = await self._lookup_client(sender_id)
                 
-                return client
+            # 2. Create client if not found
+            if not client:
+                resp = await http.post(f"{self._api_base}/api/clients", json={
+                    "name": display_name or f"Unknown ({sender_id})",
+                    "whatsapp_id": sender_id,
+                    "language": "unknown",
+                })
+                if resp.status_code in (200, 201):
+                    client = resp.json()
+                    # Add to cache immediately
+                    self._client_cache[sender_id] = client
+                    logger.info("Created new client for {} (name={})", sender_id, display_name or "Unknown")
+                
+            # 3. Update name if current name is poor quality and we have a better one
+            if client and display_name:
+                old_name = client.get("name", "")
+                name_is_poor = (
+                    not old_name
+                    or old_name == "Unknown"
+                    or old_name.startswith("Unknown (")
+                    or old_name.isdigit()
+                    or old_name.startswith("+")
+                )
+                if name_is_poor:
+                    await http.put(
+                        f"{self._api_base}/api/clients/{client['id']}",
+                        json={"name": display_name},
+                    )
+                    client["name"] = display_name
+                    logger.info("Updated client name: {} → {} (id={})", old_name, display_name, client["id"])
+
+            # 4. Log the inbound message
+            if client:
+                raw_text = content
+                if raw_text.startswith("[CLIENT"):
+                    raw_text = raw_text.split("]: ", 1)[-1] if "]: " in raw_text else raw_text
+                    
+                await http.post(f"{self._api_base}/api/messages", json={
+                    "client_id": client["id"],
+                    "source": "whatsapp",
+                    "direction": "inbound",
+                    "original_text": raw_text,
+                    "language_from": client.get("language", "unknown"),
+                })
+                logger.info("Logged inbound message from {} (client_id={})", sender_id, client["id"])
+                
+            return client
         except Exception as e:
             logger.warning("Pre-processing failed (non-fatal): {}", e)
             return None
@@ -311,40 +352,31 @@ class WhatsAppChannel(BaseChannel):
     async def _pre_process_boss_message(self, recipient_id: str, content: str) -> None:
         """Log boss messages sent from any device (not just via agent) to the database."""
         try:
-            async with httpx.AsyncClient(timeout=5.0) as http:
-                # Find client by recipient phone
-                resp = await http.get(f"{self._api_base}/api/clients")
-                clients = resp.json()
-                client = None
-                for c in clients:
-                    wid = c.get("whatsapp_id", "")
-                    wid_clean = wid.split("@")[0] if "@" in wid else wid
-                    if wid_clean == recipient_id or wid == recipient_id:
-                        client = c
-                        break
+            http = self._get_http()
+            client = await self._lookup_client(recipient_id)
 
-                if client:
-                    await http.post(f"{self._api_base}/api/messages", json={
-                        "client_id": client["id"],
-                        "source": "whatsapp",
-                        "direction": "outbound",
-                        "original_text": content,
-                        "language_from": client.get("language", "unknown"),
-                    })
-                    logger.info("Logged boss message to {} (client_id={})", recipient_id, client["id"])
-                else:
-                    logger.debug("Boss message to {} — no matching client found, skipping log", recipient_id)
+            if client:
+                await http.post(f"{self._api_base}/api/messages", json={
+                    "client_id": client["id"],
+                    "source": "whatsapp",
+                    "direction": "outbound",
+                    "original_text": content,
+                    "language_from": client.get("language", "unknown"),
+                })
+                logger.info("Logged boss message to {} (client_id={})", recipient_id, client["id"])
+            else:
+                logger.debug("Boss message to {} — no matching client found, skipping log", recipient_id)
         except Exception as e:
             logger.warning("Boss message logging failed (non-fatal): {}", e)
 
     async def _check_autopilot(self) -> bool:
         """Check if autopilot mode is enabled. Defaults to True if query fails."""
         try:
-            async with httpx.AsyncClient(timeout=3.0) as http:
-                resp = await http.get(f"{self._api_base}/api/profile")
-                if resp.status_code == 200:
-                    profile = resp.json()
-                    return profile.get("autopilot", True)
+            http = self._get_http()
+            resp = await http.get(f"{self._api_base}/api/profile")
+            if resp.status_code == 200:
+                profile = resp.json()
+                return profile.get("autopilot", True)
         except Exception as e:
             logger.debug("Autopilot check failed (defaulting to ON): {}", e)
         return True
@@ -352,26 +384,17 @@ class WhatsAppChannel(BaseChannel):
     async def _log_outbound(self, recipient_id: str, content: str) -> None:
         """Log outbound (agent reply) message to DB."""
         try:
-            async with httpx.AsyncClient(timeout=5.0) as http:
-                # Find client by phone
-                resp = await http.get(f"{self._api_base}/api/clients")
-                clients = resp.json()
-                client = None
-                for c in clients:
-                    wid = c.get("whatsapp_id", "")
-                    wid_clean = wid.split("@")[0] if "@" in wid else wid
-                    if wid_clean == recipient_id or wid == recipient_id:
-                        client = c
-                        break
+            http = self._get_http()
+            client = await self._lookup_client(recipient_id)
                 
-                if client:
-                    await http.post(f"{self._api_base}/api/messages", json={
-                        "client_id": client["id"],
-                        "source": "whatsapp",
-                        "direction": "outbound",
-                        "original_text": content,
-                        "language_from": client.get("language", "unknown"),
-                    })
-                    logger.info("Logged outbound reply to {} (client_id={})", recipient_id, client["id"])
+            if client:
+                await http.post(f"{self._api_base}/api/messages", json={
+                    "client_id": client["id"],
+                    "source": "whatsapp",
+                    "direction": "outbound",
+                    "original_text": content,
+                    "language_from": client.get("language", "unknown"),
+                })
+                logger.info("Logged outbound reply to {} (client_id={})", recipient_id, client["id"])
         except Exception as e:
             logger.warning("Outbound logging failed (non-fatal): {}", e)
