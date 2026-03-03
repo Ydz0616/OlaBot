@@ -144,6 +144,25 @@ export class BridgeServer {
   private setupClient(ws: WebSocket): void {
     this.clients.add(ws);
 
+    // Send self-phone info to the newly connected client (so gateway always knows boss phone)
+    if (this.wa) {
+      const selfPhone = (this.wa as any).selfPhone || '';
+      if (selfPhone) {
+        ws.send(JSON.stringify({
+          type: 'message',
+          id: '__self__',
+          sender: `${selfPhone}@s.whatsapp.net`,
+          pn: '',
+          content: '__SELF_PHONE__',
+          timestamp: Date.now(),
+          isGroup: false,
+          fromMe: true,
+          pushName: '',
+          contactName: '',
+        }));
+      }
+    }
+
     ws.on('message', async (data) => {
       try {
         const cmd = JSON.parse(data.toString()) as SendCommand;

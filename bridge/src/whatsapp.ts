@@ -57,6 +57,8 @@ export class WhatsAppClient {
   private reconnecting = false;
   private contacts: Map<string, SyncedContact> = new Map();
   private historyMessages: Map<string, SyncedMessage[]> = new Map();
+  private sentMessageIds: Set<string> = new Set();
+  private selfPhone: string = '';
 
   constructor(options: WhatsAppClientOptions) {
     this.options = options;
@@ -118,7 +120,28 @@ export class WhatsAppClient {
         }
       } else if (connection === 'open') {
         console.log('✅ Connected to WhatsApp');
-        this.options.onStatus('connected');
+        // Extract and broadcast self phone number for boss identification
+        const rawId = this.sock?.user?.id || '';
+        this.selfPhone = rawId.split(':')[0].split('@')[0];
+        if (this.selfPhone) {
+          console.log(`📱 Self phone: ${this.selfPhone}`);
+          // Broadcast to connected clients via onMessage with a special 'self' type
+          this.options.onStatus('connected');
+          // Send self-phone info as a special message
+          this.options.onMessage({
+            id: '__self__',
+            sender: `${this.selfPhone}@s.whatsapp.net`,
+            pn: '',
+            content: '__SELF_PHONE__',
+            timestamp: Date.now(),
+            isGroup: false,
+            fromMe: true,
+            pushName: '',
+            contactName: '',
+          });
+        } else {
+          this.options.onStatus('connected');
+        }
       }
     });
 
@@ -183,6 +206,13 @@ export class WhatsAppClient {
 
         // Live messages (type = 'notify')
         if (type !== 'notify') continue;
+
+        // Skip agent-sent messages (already logged via _log_outbound)
+        const msgId = msg.key.id || '';
+        if (fromMe && this.sentMessageIds.has(msgId)) {
+          this.sentMessageIds.delete(msgId);  // Clean up
+          continue;
+        }
 
         // Extract display names for contact resolution
         const pushName = msg.pushName || '';
@@ -256,7 +286,16 @@ export class WhatsAppClient {
       jid = `${jid}@s.whatsapp.net`;
     }
 
-    await this.sock.sendMessage(jid, { text });
+    const result = await this.sock.sendMessage(jid, { text });
+    // Track sent message ID for dedup when Baileys fires messages.upsert
+    if (result?.key?.id) {
+      this.sentMessageIds.add(result.key.id);
+      // Prevent memory leak: cap at 200 entries
+      if (this.sentMessageIds.size > 200) {
+        const first = this.sentMessageIds.values().next().value;
+        if (first) this.sentMessageIds.delete(first);
+      }
+    }
   }
 
   getContacts(): SyncedContact[] {

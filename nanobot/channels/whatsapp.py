@@ -32,6 +32,7 @@ class WhatsAppChannel(BaseChannel):
         self._ws = None
         self._connected = False
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()
+        self._boss_phone: str = ""  # Set by bridge on connect via __SELF_PHONE__
     
     async def start(self) -> None:
         """Start the WhatsApp channel by connecting to the bridge."""
@@ -111,13 +112,17 @@ class WhatsAppChannel(BaseChannel):
         msg_type = data.get("type")
         
         if msg_type == "message":
+            # ── Special: self-phone identification from bridge ──
+            content = data.get("content", "")
+            if content == "__SELF_PHONE__":
+                raw_sender = data.get("sender", "")
+                self._boss_phone = raw_sender.split("@")[0] if "@" in raw_sender else raw_sender
+                logger.info("Boss phone identified: {}", self._boss_phone)
+                return
+
             # Incoming message from WhatsApp
-            # Bridge sends two IDs but they can arrive in EITHER field:
-            #   - phone number: <digits>@s.whatsapp.net  (what we need for replies)
-            #   - LID:          <digits>@lid             (cannot send to this)
             raw_pn = data.get("pn", "")
             raw_sender = data.get("sender", "")
-            content = data.get("content", "")
             message_id = data.get("id", "")
 
             if message_id:
@@ -128,7 +133,6 @@ class WhatsAppChannel(BaseChannel):
                     self._processed_message_ids.popitem(last=False)
 
             # ── Smart routing: detect which field is the phone number ──
-            # Don't trust field names — pick whichever contains @s.whatsapp.net
             phone_jid = ""
             lid_jid = ""
             for candidate in [raw_pn, raw_sender]:
@@ -137,66 +141,83 @@ class WhatsAppChannel(BaseChannel):
                 elif "@lid" in candidate:
                     lid_jid = candidate
 
-            # Use phone number for both sender_id and reply_chat_id
             if phone_jid:
                 sender_id = phone_jid.split("@")[0]
                 reply_chat_id = phone_jid
             elif lid_jid:
-                # Fallback: only LID available (shouldn't happen normally)
                 sender_id = lid_jid.split("@")[0]
                 reply_chat_id = f"{sender_id}@s.whatsapp.net"
                 logger.warning("Only LID available for sender {}, fabricating phone JID", sender_id)
             else:
-                # Neither — use whatever we got
                 fallback = raw_pn or raw_sender
                 sender_id = fallback.split("@")[0] if "@" in fallback else fallback
                 reply_chat_id = f"{sender_id}@s.whatsapp.net"
             
             logger.info("Sender {} → reply_to {} (phone_jid={}, lid_jid={})", raw_sender, reply_chat_id, phone_jid, lid_jid)
 
-            # Handle voice transcription if it's a voice message
+            # Handle voice transcription
             if content == "[Voice Message]":
-                logger.info("Voice message received from {}, but direct download from bridge is not yet supported.", sender_id)
                 content = "[Voice Message: Transcription not available for WhatsApp yet]"
 
-            # Extract display names from bridge (pushName = WA profile name, contactName = saved contact name)
+            # Extract display names
             push_name = data.get("pushName", "")
             contact_name = data.get("contactName", "")
-            display_name = contact_name or push_name  # prefer saved contact name
+            display_name = contact_name or push_name
 
-            # Detect if message is from the boss (fromMe = true)
             from_me = data.get("fromMe", False)
-            
-            # Add clear identity prefix so LLM never confuses boss/client
+
+            # ═══════════════════════════════════════════════
+            #  MESSAGE ROUTING (6-type architecture)
+            # ═══════════════════════════════════════════════
+
             if from_me:
-                content = f"[BOSS]: {content}"
-                logger.info("Boss message from {}: {}", sender_id, content[:80])
+                if self._boss_phone and sender_id == self._boss_phone:
+                    # ── Case B: Boss → Agent (self-chat command) ──
+                    # Boss is talking to agent via self-chat. Always process.
+                    content = f"[BOSS]: {data.get('content', '')}"
+                    logger.info("Boss self-chat command: {}", content[:80])
+                    await self._handle_message(
+                        sender_id=sender_id,
+                        chat_id=reply_chat_id,
+                        content=content,
+                        metadata={
+                            "message_id": message_id,
+                            "timestamp": data.get("timestamp"),
+                            "is_group": data.get("isGroup", False),
+                            "from_me": True,
+                        }
+                    )
+                else:
+                    # ── Case C: Boss → Client (manual takeover) ──
+                    # Boss manually replied to a client. Log to DB, do NOT trigger agent.
+                    logger.info("Boss manual reply to {}: {}", sender_id, data.get('content', '')[:80])
+                    await self._pre_process_boss_message(sender_id, data.get("content", ""))
             else:
-                content = f"[CLIENT from {sender_id}]: {content}"
-                logger.info("Client message from {}: {}", sender_id, content[:80])
+                # ── Case A: Client → Boss/Agent ──
+                content_raw = data.get('content', '')
+                
+                # Pre-process: log to DB + client lookup
+                client_info = await self._pre_process(sender_id, content_raw, from_me, display_name)
+                client_name = client_info.get("name", "Unknown") if client_info else "Unknown"
+                content = f"[CLIENT from {sender_id} ({client_name})]: {content_raw}"
+                logger.info("Client message from {} ({}): {}", sender_id, client_name, content_raw[:80])
 
-            # ── Pre-processing: auto-log + client lookup (Python, not LLM) ──
-            if not from_me:
-                client_info = await self._pre_process(sender_id, content, from_me, display_name)
-                if client_info:
-                    # Inject client context so agent knows who it's talking to
-                    client_name = client_info.get("name", "Unknown")
-                    content = f"[CLIENT from {sender_id} ({client_name})]: {data.get('content', '')}"
-            else:
-                # Boss messages: outbound replies get logged via send() → _log_outbound
-                pass
-
-            await self._handle_message(
-                sender_id=sender_id,
-                chat_id=reply_chat_id,  # Use phone-based JID, never LID
-                content=content,
-                metadata={
-                    "message_id": message_id,
-                    "timestamp": data.get("timestamp"),
-                    "is_group": data.get("isGroup", False),
-                    "from_me": from_me,
-                }
-            )
+                # Check autopilot — if OFF, only log, don't send to agent
+                autopilot = await self._check_autopilot()
+                if autopilot:
+                    await self._handle_message(
+                        sender_id=sender_id,
+                        chat_id=reply_chat_id,
+                        content=content,
+                        metadata={
+                            "message_id": message_id,
+                            "timestamp": data.get("timestamp"),
+                            "is_group": data.get("isGroup", False),
+                            "from_me": False,
+                        }
+                    )
+                else:
+                    logger.info("Autopilot OFF — message logged but not sent to agent")
         
         elif msg_type == "status":
             # Connection status update
@@ -286,6 +307,47 @@ class WhatsAppChannel(BaseChannel):
         except Exception as e:
             logger.warning("Pre-processing failed (non-fatal): {}", e)
             return None
+
+    async def _pre_process_boss_message(self, recipient_id: str, content: str) -> None:
+        """Log boss messages sent from any device (not just via agent) to the database."""
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as http:
+                # Find client by recipient phone
+                resp = await http.get(f"{self._api_base}/api/clients")
+                clients = resp.json()
+                client = None
+                for c in clients:
+                    wid = c.get("whatsapp_id", "")
+                    wid_clean = wid.split("@")[0] if "@" in wid else wid
+                    if wid_clean == recipient_id or wid == recipient_id:
+                        client = c
+                        break
+
+                if client:
+                    await http.post(f"{self._api_base}/api/messages", json={
+                        "client_id": client["id"],
+                        "source": "whatsapp",
+                        "direction": "outbound",
+                        "original_text": content,
+                        "language_from": client.get("language", "unknown"),
+                    })
+                    logger.info("Logged boss message to {} (client_id={})", recipient_id, client["id"])
+                else:
+                    logger.debug("Boss message to {} — no matching client found, skipping log", recipient_id)
+        except Exception as e:
+            logger.warning("Boss message logging failed (non-fatal): {}", e)
+
+    async def _check_autopilot(self) -> bool:
+        """Check if autopilot mode is enabled. Defaults to True if query fails."""
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as http:
+                resp = await http.get(f"{self._api_base}/api/profile")
+                if resp.status_code == 200:
+                    profile = resp.json()
+                    return profile.get("autopilot", True)
+        except Exception as e:
+            logger.debug("Autopilot check failed (defaulting to ON): {}", e)
+        return True
 
     async def _log_outbound(self, recipient_id: str, content: str) -> None:
         """Log outbound (agent reply) message to DB."""
