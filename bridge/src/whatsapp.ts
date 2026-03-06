@@ -259,10 +259,16 @@ export class WhatsAppClient {
     if (ts && typeof ts === 'object' && 'low' in ts) {
       // Protobuf Long: combine high and low bits
       // For timestamps, high is usually 0, so low is sufficient
-      return (ts.high || 0) * 4294967296 + (ts.low || 0);
+      const result = (ts.high || 0) * 4294967296 + (ts.low || 0);
+      if (result > 0) return result;
     }
-    if (typeof ts === 'string') return parseInt(ts, 10) || 0;
-    return 0;
+    if (typeof ts === 'string') {
+      const parsed = parseInt(ts, 10);
+      if (parsed > 0) return parsed;
+    }
+    // Fallback: use current time rather than returning 0
+    // (0 → to_timestamp(0) = 1970-01-01 → displayed as 12/31 16:00 in UTC-8)
+    return Math.floor(Date.now() / 1000);
   }
 
   /**
@@ -847,7 +853,7 @@ export class WhatsAppClient {
               remoteJid: resolvedJid,
               fromMe,
               content,
-              timestamp: msg.messageTimestamp as number,
+              timestamp: this.normalizeTimestamp(msg.messageTimestamp),
             });
             // Enforce cap
             if (existing.length > MAX_HISTORY_PER_CHAT) {
@@ -883,7 +889,7 @@ export class WhatsAppClient {
           sender: resolvedSender,
           pn,
           content,
-          timestamp: msg.messageTimestamp as number,
+          timestamp: this.normalizeTimestamp(msg.messageTimestamp),
           isGroup,
           fromMe,
           pushName,
