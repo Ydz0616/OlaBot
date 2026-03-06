@@ -97,6 +97,7 @@ export class WhatsAppClient {
   private options: WhatsAppClientOptions;
   private reconnecting = false;
   private reconnectAttempts = 0;
+  private reconnectStableTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly maxReconnectAttempts = 5;
 
   // Contact sources
@@ -581,7 +582,19 @@ export class WhatsAppClient {
         }
       } else if (connection === 'open') {
         console.log('✅ Connected to WhatsApp');
-        this.reconnectAttempts = 0;
+
+        // Don't reset reconnectAttempts immediately — wait for stable connection.
+        // This prevents 440 loops where WhatsApp rapidly disconnects after open:
+        // open → 0 → 440 → 1 → reconnect → open → 0 (reset!) → 440 → never reaches max.
+        // With delayed reset: open → 440 → 1 → reconnect → open → 440 → 2 → ... → backs off.
+        if (this.reconnectStableTimer) clearTimeout(this.reconnectStableTimer);
+        this.reconnectStableTimer = setTimeout(() => {
+          if (this.reconnectAttempts > 0) {
+            console.log(`🔄 Connection stable for 10s — resetting reconnect counter (was ${this.reconnectAttempts})`);
+          }
+          this.reconnectAttempts = 0;
+          this.reconnectStableTimer = null;
+        }, 10000);
 
         // Extract and broadcast self phone number
         const rawId = this.sock?.user?.id || '';
