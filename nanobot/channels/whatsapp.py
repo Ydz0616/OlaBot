@@ -1,4 +1,14 @@
-"""WhatsApp channel implementation using Node.js bridge."""
+"""WhatsApp channel implementation using Node.js bridge.
+
+Handles:
+- WebSocket connection to Node.js Baileys bridge
+- 6-type message routing (Client→Agent, Boss→Agent, Boss→Client, etc.)
+- Client lookup/create with caching
+- Inbound/outbound message logging
+- History sync complete auto-import trigger
+- LID→Phone resolution via bridge's enriched contacts
+- Autopilot toggle
+"""
 
 import asyncio
 import json
@@ -39,17 +49,25 @@ class WhatsAppChannel(BaseChannel):
         self._client_cache: dict[str, dict] = {}   # phone → client dict
         self._cache_ts: float = 0.0                  # timestamp of last full refresh
         self._CACHE_TTL = 300                        # 5 minutes
-    
+        # ── LID→Phone resolution cache (from bridge) ──
+        self._lid_to_phone: dict[str, str] = {}      # LID JID → phone number
+        self._lid_cache_ts: float = 0.0
+        self._LID_CACHE_TTL = 600                    # 10 minutes
+        # ── Auto-import lock (prevent concurrent imports) ──
+        self._import_lock = asyncio.Lock()
+        self._last_import_ts: float = 0.0
+        self._IMPORT_COOLDOWN = 60                   # seconds between imports
+
     async def start(self) -> None:
         """Start the WhatsApp channel by connecting to the bridge."""
         import websockets
-        
+
         bridge_url = self.config.bridge_url
-        
+
         logger.info("Connecting to WhatsApp bridge at {}...", bridge_url)
-        
+
         self._running = True
-        
+
         while self._running:
             try:
                 async with websockets.connect(bridge_url) as ws:
@@ -59,40 +77,43 @@ class WhatsAppChannel(BaseChannel):
                         await ws.send(json.dumps({"type": "auth", "token": self.config.bridge_token}))
                     self._connected = True
                     logger.info("Connected to WhatsApp bridge")
-                    
+
+                    # Preload LID map from bridge on connect
+                    asyncio.create_task(self._refresh_lid_cache())
+
                     # Listen for messages
                     async for message in ws:
                         try:
                             await self._handle_bridge_message(message)
                         except Exception as e:
                             logger.error("Error handling bridge message: {}", e)
-                    
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 self._connected = False
                 self._ws = None
                 logger.warning("WhatsApp bridge connection error: {}", e)
-                
+
                 if self._running:
                     logger.info("Reconnecting in 5 seconds...")
                     await asyncio.sleep(5)
-    
+
     async def stop(self) -> None:
         """Stop the WhatsApp channel."""
         self._running = False
         self._connected = False
-        
+
         if self._ws:
             await self._ws.close()
             self._ws = None
-    
+
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through WhatsApp."""
         if not self._ws or not self._connected:
             logger.warning("WhatsApp bridge not connected")
             return
-        
+
         try:
             payload = {
                 "type": "send",
@@ -100,13 +121,13 @@ class WhatsAppChannel(BaseChannel):
                 "text": msg.content
             }
             await self._ws.send(json.dumps(payload, ensure_ascii=False))
-            
+
             # Auto-log outbound message to DB
             recipient_id = msg.chat_id.split("@")[0] if "@" in msg.chat_id else msg.chat_id
             await self._log_outbound(recipient_id, msg.content)
         except Exception as e:
             logger.error("Error sending WhatsApp message: {}", e)
-    
+
     async def _handle_bridge_message(self, raw: str) -> None:
         """Handle a message from the bridge."""
         try:
@@ -114,16 +135,24 @@ class WhatsAppChannel(BaseChannel):
         except json.JSONDecodeError:
             logger.warning("Invalid JSON from bridge: {}", raw[:100])
             return
-        
+
         msg_type = data.get("type")
-        
+
         if msg_type == "message":
-            # ── Special: self-phone identification from bridge ──
             content = data.get("content", "")
+
+            # ── Special: self-phone identification from bridge ──
             if content == "__SELF_PHONE__":
                 raw_sender = data.get("sender", "")
                 self._boss_phone = raw_sender.split("@")[0] if "@" in raw_sender else raw_sender
                 logger.info("Boss phone identified: {}", self._boss_phone)
+                return
+
+            # ── Special: history sync complete signal ──
+            if content == "__HISTORY_SYNC_COMPLETE__":
+                logger.info("History sync complete signal received from bridge")
+                # Auto-import disabled — user prefers manual Import via UI
+                # asyncio.create_task(self._trigger_auto_import())
                 return
 
             # Incoming message from WhatsApp
@@ -138,7 +167,7 @@ class WhatsAppChannel(BaseChannel):
                 while len(self._processed_message_ids) > 1000:
                     self._processed_message_ids.popitem(last=False)
 
-            # ── Smart routing: detect which field is the phone number ──
+            # ── Smart routing: resolve sender to phone JID ──
             phone_jid = ""
             lid_jid = ""
             for candidate in [raw_pn, raw_sender]:
@@ -151,14 +180,21 @@ class WhatsAppChannel(BaseChannel):
                 sender_id = phone_jid.split("@")[0]
                 reply_chat_id = phone_jid
             elif lid_jid:
-                sender_id = lid_jid.split("@")[0]
-                reply_chat_id = f"{sender_id}@s.whatsapp.net"
-                logger.warning("Only LID available for sender {}, fabricating phone JID", sender_id)
+                # Try to resolve LID via bridge's LID map
+                resolved = self._resolve_lid(lid_jid)
+                if resolved:
+                    sender_id = resolved
+                    reply_chat_id = f"{resolved}@s.whatsapp.net"
+                    logger.info("Resolved LID {} → phone {}", lid_jid, resolved)
+                else:
+                    sender_id = lid_jid.split("@")[0]
+                    reply_chat_id = f"{sender_id}@s.whatsapp.net"
+                    logger.warning("LID {} has no phone mapping, using raw value", lid_jid)
             else:
                 fallback = raw_pn or raw_sender
                 sender_id = fallback.split("@")[0] if "@" in fallback else fallback
                 reply_chat_id = f"{sender_id}@s.whatsapp.net"
-            
+
             logger.info("Sender {} → reply_to {} (phone_jid={}, lid_jid={})", raw_sender, reply_chat_id, phone_jid, lid_jid)
 
             # Handle voice transcription
@@ -179,7 +215,6 @@ class WhatsAppChannel(BaseChannel):
             if from_me:
                 if self._boss_phone and sender_id == self._boss_phone:
                     # ── Case B: Boss → Agent (self-chat command) ──
-                    # Boss is talking to agent via self-chat. Always process.
                     content = f"[BOSS]: {data.get('content', '')}"
                     logger.info("Boss self-chat command: {}", content[:80])
                     await self._handle_message(
@@ -195,13 +230,12 @@ class WhatsAppChannel(BaseChannel):
                     )
                 else:
                     # ── Case C: Boss → Client (manual takeover) ──
-                    # Boss manually replied to a client. Log to DB, do NOT trigger agent.
                     logger.info("Boss manual reply to {}: {}", sender_id, data.get('content', '')[:80])
                     await self._pre_process_boss_message(sender_id, data.get("content", ""))
             else:
                 # ── Case A: Client → Boss/Agent ──
                 content_raw = data.get('content', '')
-                
+
                 # Pre-process: log to DB + client lookup
                 client_info = await self._pre_process(sender_id, content_raw, from_me, display_name)
                 client_name = client_info.get("name", "Unknown") if client_info else "Unknown"
@@ -224,25 +258,122 @@ class WhatsAppChannel(BaseChannel):
                     )
                 else:
                     logger.info("Autopilot OFF — message logged but not sent to agent")
-        
+
         elif msg_type == "status":
-            # Connection status update
             status = data.get("status")
             logger.info("WhatsApp status: {}", status)
-            
+
             if status == "connected":
                 self._connected = True
             elif status == "disconnected":
                 self._connected = False
-        
+
         elif msg_type == "qr":
-            # QR code for authentication
             logger.info("Scan QR code in the bridge terminal to connect WhatsApp")
-        
+
         elif msg_type == "error":
             logger.error("WhatsApp bridge error: {}", data.get('error'))
 
-    # ── Pre-processing pipeline ──────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════
+    # AUTO-IMPORT (triggered by history_sync_complete)
+    # ═══════════════════════════════════════════════════════════════
+
+    async def _trigger_auto_import(self) -> None:
+        """Trigger backend auto-import when bridge signals history sync complete.
+
+        Guarded by lock and cooldown to prevent concurrent/repeated imports.
+        """
+        if self._import_lock.locked():
+            logger.info("Auto-import already in progress, skipping")
+            return
+
+        # Cooldown check
+        now = time.monotonic()
+        if now - self._last_import_ts < self._IMPORT_COOLDOWN:
+            logger.info("Auto-import cooldown active ({:.0f}s remaining), skipping",
+                        self._IMPORT_COOLDOWN - (now - self._last_import_ts))
+            return
+
+        async with self._import_lock:
+            self._last_import_ts = time.monotonic()
+            logger.info("Triggering backend auto-import...")
+            try:
+                http = self._get_http()
+                resp = await http.post(
+                    f"{self._api_base}/api/clients/auto-import",
+                    timeout=60.0,  # Import can take a while
+                )
+                if resp.status_code == 200:
+                    result = resp.json()
+                    logger.info(
+                        "Auto-import complete: created={}, updated={}, skipped={}, history={}",
+                        result.get("contacts_created", 0),
+                        result.get("contacts_updated", 0),
+                        result.get("contacts_skipped", 0),
+                        result.get("history_logged", 0),
+                    )
+                    errors = result.get("errors", [])
+                    if errors:
+                        for err in errors:
+                            logger.warning("Auto-import error: {}", err)
+                    # Refresh client cache after importing new clients
+                    await self._refresh_client_cache()
+                else:
+                    logger.error("Auto-import failed: HTTP {} — {}", resp.status_code, resp.text[:200])
+            except Exception as e:
+                logger.error("Auto-import request failed: {}", e)
+
+    # ═══════════════════════════════════════════════════════════════
+    # LID → PHONE RESOLUTION
+    # ═══════════════════════════════════════════════════════════════
+
+    async def _refresh_lid_cache(self) -> None:
+        """Fetch LID→Phone mappings from bridge's enriched contacts."""
+        try:
+            bridge_http = self._bridge_http_url
+            http = self._get_http()
+            resp = await http.get(f"{bridge_http}/contacts/enriched", timeout=10.0)
+            if resp.status_code == 200:
+                data = resp.json()
+                contacts = data.get("contacts", [])
+                self._lid_to_phone.clear()
+                for c in contacts:
+                    lid = c.get("lid", "")
+                    phone = c.get("phone", "")
+                    if lid and phone:
+                        self._lid_to_phone[lid] = phone
+                        # Also store without @lid suffix
+                        lid_bare = lid.split("@")[0]
+                        self._lid_to_phone[lid_bare] = phone
+                self._lid_cache_ts = time.monotonic()
+                logger.info("LID cache refreshed: {} mappings", len(self._lid_to_phone) // 2)
+        except Exception as e:
+            logger.warning("LID cache refresh failed: {}", e)
+
+    def _resolve_lid(self, lid_jid: str) -> str | None:
+        """Resolve a LID JID to a phone number. Returns phone digits or None."""
+        # Try full JID
+        phone = self._lid_to_phone.get(lid_jid)
+        if phone:
+            return phone
+        # Try bare LID (without @lid suffix)
+        bare = lid_jid.split("@")[0] if "@" in lid_jid else lid_jid
+        return self._lid_to_phone.get(bare)
+
+    @property
+    def _bridge_http_url(self) -> str:
+        """Derive bridge HTTP URL from the WebSocket URL."""
+        # ws://bridge:3001 → http://bridge:3002
+        # ws://localhost:3001 → http://localhost:3002
+        ws_url = self.config.bridge_url
+        http_url = ws_url.replace("ws://", "http://").replace("wss://", "https://")
+        # Replace port: 3001 → 3002
+        if ":3001" in http_url:
+            http_url = http_url.replace(":3001", ":3002")
+        elif http_url.endswith("/"):
+            # If no explicit port, assume default bridge ports
+            http_url = http_url.rstrip("/")
+        return http_url
 
     # ── Shared HTTP client & client cache ────────────────────────────
 
@@ -276,12 +407,12 @@ class WhatsAppChannel(BaseChannel):
         # Refresh cache if stale
         if time.monotonic() - self._cache_ts > self._CACHE_TTL:
             await self._refresh_client_cache()
-        
+
         # Try cache hit
         client = self._client_cache.get(phone)
         if client:
             return client
-        
+
         # Miss — try one more refresh in case it's a new client
         await self._refresh_client_cache()
         return self._client_cache.get(phone)
@@ -297,7 +428,7 @@ class WhatsAppChannel(BaseChannel):
 
             # 1. Find client by WhatsApp ID (cached)
             client = await self._lookup_client(sender_id)
-                
+
             # 2. Create client if not found
             if not client:
                 resp = await http.post(f"{self._api_base}/api/clients", json={
@@ -310,7 +441,7 @@ class WhatsAppChannel(BaseChannel):
                     # Add to cache immediately
                     self._client_cache[sender_id] = client
                     logger.info("Created new client for {} (name={})", sender_id, display_name or "Unknown")
-                
+
             # 3. Update name if current name is poor quality and we have a better one
             if client and display_name:
                 old_name = client.get("name", "")
@@ -334,7 +465,7 @@ class WhatsAppChannel(BaseChannel):
                 raw_text = content
                 if raw_text.startswith("[CLIENT"):
                     raw_text = raw_text.split("]: ", 1)[-1] if "]: " in raw_text else raw_text
-                    
+
                 await http.post(f"{self._api_base}/api/messages", json={
                     "client_id": client["id"],
                     "source": "whatsapp",
@@ -343,7 +474,7 @@ class WhatsAppChannel(BaseChannel):
                     "language_from": client.get("language", "unknown"),
                 })
                 logger.info("Logged inbound message from {} (client_id={})", sender_id, client["id"])
-                
+
             return client
         except Exception as e:
             logger.warning("Pre-processing failed (non-fatal): {}", e)
@@ -386,7 +517,7 @@ class WhatsAppChannel(BaseChannel):
         try:
             http = self._get_http()
             client = await self._lookup_client(recipient_id)
-                
+
             if client:
                 await http.post(f"{self._api_base}/api/messages", json={
                     "client_id": client["id"],
