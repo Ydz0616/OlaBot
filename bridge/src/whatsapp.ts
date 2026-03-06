@@ -493,8 +493,10 @@ export class WhatsAppClient {
     this.historyContacts.clear();
     this.selfPhone = '';
     this.historySyncReceived = false;
+    this.reconnectAttempts = 0;
+    this.reconnecting = false;
 
-    console.log('🗑️ Cleared all in-memory state (history, LID map, contacts)');
+    console.log('🗑️ Cleared all in-memory state (history, LID map, contacts, reconnect counters)');
   }
 
   // ═══════════════════════════════════════════════════════════════

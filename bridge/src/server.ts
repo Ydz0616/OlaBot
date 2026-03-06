@@ -208,14 +208,24 @@ export class BridgeServer {
     if (url === '/auth/reset' && req.method === 'POST') {
       console.log('🔑 Auth reset requested via HTTP API');
       if (this.wa) {
+        // Reset all tracking state
+        this.connectionStatus = 'disconnected';
+        this.latestQR = null;
+        this.fullSyncComplete = false;
+
+        // Disconnect → clear auth → reconnect (fresh QR)
         this.wa.disconnect().then(() => {
           this.wa!.clearAuthState();
-          this.connectionStatus = 'disconnected';
-          this.latestQR = null;
-          // Reconnect to get fresh QR
-          this.wa!.connect().catch(err => {
-            console.error('Failed to reconnect after auth reset:', err);
-          });
+          // clearAuthState resets reconnectAttempts internally
+          return this.wa!.connect();
+        }).catch(err => {
+          console.error('Failed to reconnect after auth reset:', err);
+          // Last resort: try connecting again after a delay
+          setTimeout(() => {
+            this.wa!.connect().catch(e => {
+              console.error('Retry after auth reset also failed:', e);
+            });
+          }, 3000);
         });
       }
       res.writeHead(200);
