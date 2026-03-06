@@ -788,10 +788,10 @@ export class WhatsAppClient {
       this.historySyncDebounceTimer = setTimeout(async () => {
         this.historySyncDebounceTimer = null;
 
-        // Step 5b: Active fetch for under-synced chats
-        // WhatsApp's passive sync may only send 1-2 messages for some chats.
-        // Use fetchMessageHistory() to request more for chats with < 10 messages.
-        await this.fetchAdditionalHistory();
+        // Note: fetchAdditionalHistory() has been DISABLED.
+        // It sent dozens of fetchMessageHistory() requests which triggered
+        // WhatsApp rate-limiting (status 440 disconnect loops).
+        // Passive sync via messaging-history.set is sufficient.
 
         this.historySyncReceived = true;
         this.saveHistory();
