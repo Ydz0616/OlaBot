@@ -108,29 +108,11 @@ class WhatsAppChannel(BaseChannel):
             await self._ws.close()
             self._ws = None
 
-    # ── Outbound filter: block internal leaks from reaching clients ──
-    _BLOCKED_PATTERNS = [
-        "(Logged message",
-        "\U0001f4cb [",           # 📋 — boss-only notifications
-        "Autopilot is OFF",
-        "I've completed processing",
-        "Error calling LLM",
-        "litellm.",
-        "Sorry, I encountered an error",
-    ]
-
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through WhatsApp."""
         if not self._ws or not self._connected:
             logger.warning("WhatsApp bridge not connected")
             return
-
-        # ── Safety filter: block internal/system messages from reaching clients ──
-        content = msg.content or ""
-        for pattern in self._BLOCKED_PATTERNS:
-            if pattern in content:
-                logger.warning("BLOCKED outbound to {}: {}", msg.chat_id, content[:120])
-                return
 
         try:
             payload = {
@@ -396,12 +378,9 @@ class WhatsAppChannel(BaseChannel):
     # ── Shared HTTP client & client cache ────────────────────────────
 
     def _get_http(self) -> httpx.AsyncClient:
-        """Get or create shared HTTP client with robust pool config."""
+        """Get or create shared HTTP client."""
         if self._http is None or self._http.is_closed:
-            self._http = httpx.AsyncClient(
-                timeout=httpx.Timeout(10.0, pool=5.0),
-                limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
-            )
+            self._http = httpx.AsyncClient(timeout=5.0)
         return self._http
 
     async def _refresh_client_cache(self) -> None:
@@ -487,17 +466,14 @@ class WhatsAppChannel(BaseChannel):
                 if raw_text.startswith("[CLIENT"):
                     raw_text = raw_text.split("]: ", 1)[-1] if "]: " in raw_text else raw_text
 
-                resp = await http.post(f"{self._api_base}/api/messages", json={
+                await http.post(f"{self._api_base}/api/messages", json={
                     "client_id": client["id"],
                     "source": "whatsapp",
                     "direction": "inbound",
                     "original_text": raw_text,
                     "language_from": client.get("language", "unknown"),
                 })
-                if resp.status_code in (200, 201):
-                    logger.info("Logged inbound message from {} (client_id={})", sender_id, client["id"])
-                else:
-                    logger.error("FAILED to log inbound from {}: HTTP {} — {}", sender_id, resp.status_code, resp.text[:200])
+                logger.info("Logged inbound message from {} (client_id={})", sender_id, client["id"])
 
             return client
         except Exception as e:
@@ -511,34 +487,29 @@ class WhatsAppChannel(BaseChannel):
             client = await self._lookup_client(recipient_id)
 
             if client:
-                resp = await http.post(f"{self._api_base}/api/messages", json={
+                await http.post(f"{self._api_base}/api/messages", json={
                     "client_id": client["id"],
                     "source": "whatsapp",
                     "direction": "outbound",
                     "original_text": content,
                     "language_from": client.get("language", "unknown"),
                 })
-                if resp.status_code in (200, 201):
-                    logger.info("Logged boss message to {} (client_id={})", recipient_id, client["id"])
-                else:
-                    logger.error("FAILED to log boss message to {}: HTTP {} — {}", recipient_id, resp.status_code, resp.text[:200])
+                logger.info("Logged boss message to {} (client_id={})", recipient_id, client["id"])
             else:
                 logger.debug("Boss message to {} — no matching client found, skipping log", recipient_id)
         except Exception as e:
             logger.warning("Boss message logging failed (non-fatal): {}", e)
 
     async def _check_autopilot(self) -> bool:
-        """Check if autopilot mode is enabled. Defaults to False (OFF) on failure — safety first."""
+        """Check if autopilot mode is enabled. Defaults to OFF on failure."""
         try:
             http = self._get_http()
-            resp = await http.get(f"{self._api_base}/api/profile", timeout=10.0)
+            resp = await http.get(f"{self._api_base}/api/profile")
             if resp.status_code == 200:
                 profile = resp.json()
                 return profile.get("autopilot", False)
-            else:
-                logger.warning("Autopilot check returned HTTP {} — defaulting to OFF", resp.status_code)
         except Exception as e:
-            logger.warning("Autopilot check FAILED — defaulting to OFF for safety: {}", e)
+            logger.warning("Autopilot check failed (defaulting to OFF): {}: {}", type(e).__name__, e)
         return False
 
     async def _log_outbound(self, recipient_id: str, content: str) -> None:
@@ -548,16 +519,13 @@ class WhatsAppChannel(BaseChannel):
             client = await self._lookup_client(recipient_id)
 
             if client:
-                resp = await http.post(f"{self._api_base}/api/messages", json={
+                await http.post(f"{self._api_base}/api/messages", json={
                     "client_id": client["id"],
                     "source": "whatsapp",
                     "direction": "outbound",
                     "original_text": content,
                     "language_from": client.get("language", "unknown"),
                 })
-                if resp.status_code in (200, 201):
-                    logger.info("Logged outbound reply to {} (client_id={})", recipient_id, client["id"])
-                else:
-                    logger.error("FAILED to log outbound to {}: HTTP {} — {}", recipient_id, resp.status_code, resp.text[:200])
+                logger.info("Logged outbound reply to {} (client_id={})", recipient_id, client["id"])
         except Exception as e:
             logger.warning("Outbound logging failed (non-fatal): {}", e)
