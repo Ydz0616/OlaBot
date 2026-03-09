@@ -465,7 +465,11 @@ class AgentLoop:
         self.sessions.save(session)
 
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_any:
-            return None  # Agent sent explicit message(s) — suppress default reply to prevent leak
+            # Suppress default reply when agent already sent via message() tool,
+            # UNLESS the sender is the boss (owner) — boss needs feedback on the dashboard.
+            sender_type = (msg.metadata or {}).get("sender_type", "")
+            if sender_type != "owner":
+                return None  # Suppress default reply to prevent duplicate messages to clients
 
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
