@@ -85,7 +85,7 @@ const LID_MAP_FILE = 'lid_map.json';
 // ─── Constants ──────────────────────────────────────────────────
 
 /** Max history messages stored per chat. */
-const MAX_HISTORY_PER_CHAT = 200;
+const MAX_HISTORY_PER_CHAT = 5000;
 
 /** Max sent message IDs to track for dedup. */
 const MAX_SENT_IDS = 500;
@@ -807,10 +807,20 @@ export class WhatsAppClient {
       this.historySyncDebounceTimer = setTimeout(async () => {
         this.historySyncDebounceTimer = null;
 
-        // Note: fetchAdditionalHistory() has been DISABLED.
-        // It sent dozens of fetchMessageHistory() requests which triggered
-        // WhatsApp rate-limiting (status 440 disconnect loops).
-        // Passive sync via messaging-history.set is sufficient.
+        // Final LID re-key pass: contacts.upsert events may have arrived AFTER
+        // messaging-history.set, giving us new LID→Phone mappings. Run one more
+        // re-key now that the debounce has settled to catch those late mappings.
+        const finalReKeyed = this.rekeyHistoryFromLid();
+        if (finalReKeyed > 0) {
+          console.log(`🔄 Final LID re-key: resolved ${finalReKeyed} chats to real phone JIDs`);
+          this.saveHistory();
+        }
+
+        // Log any chats that are still stuck under @lid (no phone mapping found)
+        const unresolvedLids = Array.from(this.historyMessages.keys()).filter(j => j.endsWith('@lid'));
+        if (unresolvedLids.length > 0) {
+          console.warn(`⚠️ ${unresolvedLids.length} chats still unresolved (no phone mapping): ${unresolvedLids.slice(0, 5).join(', ')}${unresolvedLids.length > 5 ? '...' : ''}`);
+        }
 
         this.historySyncReceived = true;
         this.saveHistory();

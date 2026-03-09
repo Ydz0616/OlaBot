@@ -150,6 +150,7 @@ export class BridgeServer {
         contactCount: this.wa?.getEnrichedContacts().length || 0,
         historyChats: this.wa?.getHistoryMessages().size || 0,
         totalMessages: Array.from(this.wa?.getHistoryMessages().values() || []).reduce((sum, msgs) => sum + msgs.length, 0),
+        unresolvedLidChats: Array.from(this.wa?.getHistoryMessages().keys() || []).filter(jid => jid.endsWith('@lid')).length,
         lidMappings: this.wa?.getLidMap().size || 0,
       }));
       return;
