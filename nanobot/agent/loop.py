@@ -18,6 +18,7 @@ from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.message import MessageTool
+from nanobot.agent.tools.notify_boss import NotifyBossTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
@@ -123,6 +124,7 @@ class AgentLoop:
         self.tools.register(WebSearchTool(api_key=self.brave_api_key))
         self.tools.register(WebFetchTool())
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
+        self.tools.register(NotifyBossTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
@@ -416,6 +418,24 @@ class AgentLoop:
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
+
+        # Configure boss routing tools for this message
+        meta = msg.metadata or {}
+        boss_phone = meta.get("boss_phone", "")
+        sender_type = meta.get("sender_type", "")
+        is_contact = sender_type == "contact"
+        boss_jid = f"{boss_phone}@s.whatsapp.net" if boss_phone else ""
+
+        if nb_tool := self.tools.get("notify_boss"):
+            if isinstance(nb_tool, NotifyBossTool):
+                nb_tool.set_boss(channel="whatsapp", chat_id=boss_jid)
+
+        if message_tool := self.tools.get("message"):
+            if isinstance(message_tool, MessageTool):
+                if is_contact and boss_jid:
+                    message_tool.set_contact_mode(boss_jid)
+                else:
+                    message_tool.clear_contact_mode()
 
         history = session.get_history(max_messages=self.memory_window)
         initial_messages = self.context.build_messages(

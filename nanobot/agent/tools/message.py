@@ -22,6 +22,8 @@ class MessageTool(Tool):
         self._default_message_id = default_message_id
         self._sent_in_turn: bool = False
         self._sent_any: bool = False  # tracks send to ANY target (cross-chat included)
+        self._boss_chat_id: str = ""  # set by AgentLoop for contact-mode guard
+        self._is_contact_mode: bool = False  # True when handling a CONTACT message
 
     def set_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
         """Set the current message context."""
@@ -37,6 +39,16 @@ class MessageTool(Tool):
         """Reset per-turn send tracking."""
         self._sent_in_turn = False
         self._sent_any = False
+
+    def set_contact_mode(self, boss_chat_id: str) -> None:
+        """Enable contact-mode guard. Blocks messages to non-boss targets."""
+        self._is_contact_mode = True
+        self._boss_chat_id = boss_chat_id
+
+    def clear_contact_mode(self) -> None:
+        """Disable contact-mode guard (owner messages)."""
+        self._is_contact_mode = False
+        self._boss_chat_id = ""
 
     @property
     def name(self) -> str:
@@ -90,6 +102,15 @@ class MessageTool(Tool):
 
         if not self._send_callback:
             return "Error: Message sending not configured"
+
+        # Contact-mode guard: block sends to non-boss targets
+        if self._is_contact_mode and self._boss_chat_id:
+            if chat_id != self._boss_chat_id:
+                return (
+                    f"Error: In contact-mode, the 'message' tool can only send to the boss. "
+                    f"Use 'notify_boss' to notify the owner, or reply directly via your text response "
+                    f"to message the contact."
+                )
 
         msg = OutboundMessage(
             channel=channel,
