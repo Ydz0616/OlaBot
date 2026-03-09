@@ -423,6 +423,7 @@ class AgentLoop:
             current_message=msg.content,
             media=msg.media if msg.media else None,
             channel=msg.channel, chat_id=msg.chat_id,
+            metadata=msg.metadata,  # carries boss_phone, sender_type for identity
         )
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
@@ -443,8 +444,8 @@ class AgentLoop:
         self._save_turn(session, all_msgs, 1 + len(history))
         self.sessions.save(session)
 
-        if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
-            return None
+        if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_any:
+            return None  # Agent sent explicit message(s) — suppress default reply to prevent leak
 
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)

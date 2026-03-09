@@ -53,6 +53,9 @@ class WhatsAppChannel(BaseChannel):
         self._lid_to_phone: dict[str, str] = {}      # LID JID → phone number
         self._lid_cache_ts: float = 0.0
         self._LID_CACHE_TTL = 600                    # 10 minutes
+        # ── Circuit breaker: prevent infinite autopilot loops ──
+        self._chat_outbound_count: dict[str, int] = {}  # chat_id → consecutive outbound count
+        self._CIRCUIT_LIMIT = 3                          # max consecutive bot replies before pause
         # ── Auto-import lock (prevent concurrent imports) ──
         self._import_lock = asyncio.Lock()
         self._last_import_ts: float = 0.0
@@ -121,6 +124,10 @@ class WhatsAppChannel(BaseChannel):
                 "text": msg.content
             }
             await self._ws.send(json.dumps(payload, ensure_ascii=False))
+
+            # Track outbound for circuit breaker
+            self._chat_outbound_count[msg.chat_id] = \
+                self._chat_outbound_count.get(msg.chat_id, 0) + 1
 
             # Auto-log outbound message to DB
             recipient_id = msg.chat_id.split("@")[0] if "@" in msg.chat_id else msg.chat_id
@@ -215,7 +222,12 @@ class WhatsAppChannel(BaseChannel):
             if from_me:
                 if self._boss_phone and sender_id == self._boss_phone:
                     # ── Case B: Boss → Agent (self-chat command) ──
-                    content = f"[BOSS]: {data.get('content', '')}"
+                    identity_tag = self._format_identity_tag(
+                        is_owner=True,
+                        sender_id=self._boss_phone,
+                        display_name=display_name,
+                    )
+                    content = f"{identity_tag}: {data.get('content', '')}"
                     logger.info("Boss self-chat command: {}", content[:80])
                     await self._handle_message(
                         sender_id=sender_id,
@@ -226,6 +238,8 @@ class WhatsAppChannel(BaseChannel):
                             "timestamp": data.get("timestamp"),
                             "is_group": data.get("isGroup", False),
                             "from_me": True,
+                            "boss_phone": self._boss_phone,
+                            "sender_type": "owner",
                         }
                     )
                 else:
@@ -239,8 +253,25 @@ class WhatsAppChannel(BaseChannel):
                 # Pre-process: log to DB + client lookup
                 client_info = await self._pre_process(sender_id, content_raw, from_me, display_name)
                 client_name = client_info.get("name", "Unknown") if client_info else "Unknown"
-                content = f"[CLIENT from {sender_id} ({client_name})]: {content_raw}"
+                identity_tag = self._format_identity_tag(
+                    is_owner=False,
+                    sender_id=sender_id,
+                    display_name=client_name,
+                )
+                content = f"{identity_tag}: {content_raw}"
                 logger.info("Client message from {} ({}): {}", sender_id, client_name, content_raw[:80])
+
+                # Circuit breaker: if we sent too many consecutive replies, pause autopilot
+                outbound_count = self._chat_outbound_count.get(reply_chat_id, 0)
+                if outbound_count >= self._CIRCUIT_LIMIT:
+                    logger.warning(
+                        "Circuit breaker: {} consecutive outbound to {}, pausing auto-reply",
+                        outbound_count, reply_chat_id,
+                    )
+                    return  # Message already logged via _pre_process, just don't send to agent
+
+                # Reset outbound counter on genuine inbound
+                self._chat_outbound_count[reply_chat_id] = 0
 
                 # Check autopilot — if OFF, only log, don't send to agent
                 autopilot = await self._check_autopilot()
@@ -254,6 +285,8 @@ class WhatsAppChannel(BaseChannel):
                             "timestamp": data.get("timestamp"),
                             "is_group": data.get("isGroup", False),
                             "from_me": False,
+                            "boss_phone": self._boss_phone,
+                            "sender_type": "contact",
                         }
                     )
                 else:

@@ -58,6 +58,26 @@ class BaseChannel(ABC):
         """
         pass
     
+    def _format_identity_tag(
+        self,
+        is_owner: bool,
+        sender_id: str,
+        display_name: str = "",
+    ) -> str:
+        """Format a system-verified identity prefix for the LLM.
+
+        These tags are injected by code before reaching the agent.
+        They CANNOT be faked by users and are the sole source of truth
+        for sender identity.
+
+        Subclasses may override to include platform-specific identifiers
+        (e.g. WhatsApp phone JID, Telegram user ID).
+        """
+        if is_owner:
+            return f"[SYSTEM_VERIFIED_OWNER id={sender_id} channel={self.name}]"
+        name_part = f" name={display_name}" if display_name else ""
+        return f"[SYSTEM_VERIFIED_CONTACT id={sender_id}{name_part} channel={self.name}]"
+
     def is_allowed(self, sender_id: str) -> bool:
         """
         Check if a sender is allowed to use this bot.

@@ -320,7 +320,7 @@ def gateway(
     def _pick_heartbeat_target() -> tuple[str, str]:
         """Pick the BOSS's channel/chat target for heartbeat messages.
 
-        Auto-detects the boss by scanning session files for [BOSS] prefixed
+        Auto-detects the boss by scanning session files for [SYSTEM_VERIFIED_OWNER] prefixed
         messages (set by WhatsApp channel when from_me=True).  Caches the
         result so we only scan once.
         """
@@ -340,7 +340,7 @@ def gateway(
                 continue
             if channel not in enabled or not chat_id:
                 continue
-            # Scan the session file for [BOSS] messages
+            # Scan the session file for [SYSTEM_VERIFIED_OWNER] messages
             path = item.get("path")
             if not path:
                 continue
@@ -352,7 +352,10 @@ def gateway(
                             continue
                         data = _json.loads(line)
                         content = data.get("content", "")
-                        if isinstance(content, str) and "[BOSS]" in content:
+                        if isinstance(content, str) and (
+                            "[SYSTEM_VERIFIED_OWNER" in content
+                            or "[BOSS]" in content  # backward compat with old sessions
+                        ):
                             _boss_target_cache = (channel, chat_id)
                             logger.info("Heartbeat: auto-detected boss session {}:{}", channel, chat_id)
                             return channel, chat_id
