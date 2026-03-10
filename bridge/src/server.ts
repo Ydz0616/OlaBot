@@ -41,7 +41,8 @@ export class BridgeServer {
     if (this.token) console.log('🔒 Token authentication enabled');
 
     // Start HTTP API server for frontend polling
-    const httpPort = this.port + 1; // e.g. 3002 if bridge is 3001
+    // Use BRIDGE_HTTP_PORT env var if set (baremetal multi-user), else fallback to port+1
+    const httpPort = parseInt(process.env.BRIDGE_HTTP_PORT || String(this.port + 1), 10);
     this.httpServer = createServer((req, res) => this.handleHTTP(req, res));
     this.httpServer.listen(httpPort, host, () => {
       console.log(`🌐 HTTP API listening on http://${host}:${httpPort}`);
