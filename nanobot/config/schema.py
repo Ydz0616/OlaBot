@@ -269,7 +269,7 @@ class HeartbeatConfig(Base):
     """Heartbeat service configuration."""
 
     enabled: bool = True
-    interval_s: int = 30 * 60  # 30 minutes
+    interval_s: int = 24 * 60 * 60  # 24 hours
 
 
 class GatewayConfig(Base):

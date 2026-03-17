@@ -57,7 +57,7 @@ class HeartbeatService:
         model: str,
         on_execute: Callable[[str], Coroutine[Any, Any, str]] | None = None,
         on_notify: Callable[[str], Coroutine[Any, Any, None]] | None = None,
-        interval_s: int = 30 * 60,
+        interval_s: int = 24 * 60 * 60,
         enabled: bool = True,
     ):
         self.workspace = workspace
